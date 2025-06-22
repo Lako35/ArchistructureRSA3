@@ -40,10 +40,15 @@ import java.util.Random;
 
 public class CryptoGui extends JFrame {
 
+    private boolean encryptKeyLoaded = false;
+    private boolean verifyKeyLoaded  = false;
+    private boolean signKeyLoaded    = false;
+    private boolean decryptKeyLoaded = false;
+    private boolean fileOpKeysLoaded = false;
 
-    
-    
-private JTextField selectedFileField;
+
+
+    private JTextField selectedFileField;
 private JButton   selectFileBtn;
 private JTextArea fileOpPublicKeyArea;
 private JButton   browseFileOpPublicBtn;
@@ -191,9 +196,6 @@ private JButton   browseFileOpPrivateBtn;
 
         // ── Public Key panel ───────────────────────────────────────────
         fileOpPublicKeyArea = new JTextArea();
-        try {
-            fileOpPublicKeyArea.setText(Files.readString(Paths.get("publickey.pem")));
-        } catch (IOException ignored) {}
         JPanel pubKeyPanel = new JPanel(new BorderLayout(4,4));
         pubKeyPanel.setBorder(BorderFactory.createTitledBorder("Public Key"));
         pubKeyPanel.add(new JScrollPane(fileOpPublicKeyArea), BorderLayout.CENTER);
@@ -203,9 +205,8 @@ private JButton   browseFileOpPrivateBtn;
 
         // ── Private Key panel ──────────────────────────────────────────
         fileOpPrivateKeyArea = new JTextArea();
-        try {
-            fileOpPrivateKeyArea.setText(Files.readString(Paths.get("privatekey.pem")));
-        } catch (IOException ignored) {}
+        fileOpPrivateKeyArea.setColumns(5);
+
         JPanel privKeyPanel = new JPanel(new BorderLayout(4,4));
         privKeyPanel.setBorder(BorderFactory.createTitledBorder("Private Key"));
         privKeyPanel.add(new JScrollPane(fileOpPrivateKeyArea), BorderLayout.CENTER);
@@ -498,12 +499,28 @@ private JButton   browseFileOpPrivateBtn;
     private void showCard(String name) {
         cardLayout.show(cardPanel, name);
         clearStatus();
-        if ("Sign".equals(name)) {
+
+
+        if ("File Operations".equals(name) && !fileOpKeysLoaded) {
+                       loadDefaultFileOpKeys();
+                       fileOpKeysLoaded = true;
+                   }
+        if ("Sign".equals(name) && !signKeyLoaded) {
             loadDefaultSignKey();
+            signKeyLoaded = true;
         }
-        if ("Verify".equals(name)) loadDefaultVerifyKey();
-        if ("Encrypt".equals(name)) loadDefaultEncryptKey();
-        if ("Decrypt".equals(name)) loadDefaultDecryptKey();
+        if ("Verify".equals(name) && !verifyKeyLoaded) {
+            verifyKeyLoaded = true;
+            loadDefaultVerifyKey();
+        }
+        if ("Encrypt".equals(name) && !encryptKeyLoaded) {
+            loadDefaultEncryptKey();
+            encryptKeyLoaded = true; 
+        }
+        if ("Decrypt".equals(name) && !decryptKeyLoaded) {
+            loadDefaultDecryptKey();
+            decryptKeyLoaded = true;
+        }
 
 
         cardPanel.revalidate();
@@ -516,6 +533,8 @@ private JButton   browseFileOpPrivateBtn;
 
         // ── PRIVATE KEY ─────────────────────────────────────────
         decryptPrivateKeyArea = new JTextArea();
+        decryptPrivateKeyArea.setColumns(5);
+
         JScrollPane keyScroll = new JScrollPane(decryptPrivateKeyArea);
         keyScroll.setBorder(BorderFactory.createTitledBorder("PRIVATE KEY"));
         browseDecryptBtn = new JButton("Browse");
@@ -815,6 +834,8 @@ private JButton   browseFileOpPrivateBtn;
 
         // Key text areas with titled borders
         privateKeyArea = new JTextArea();
+        privateKeyArea.setColumns(5);
+
         publicKeyArea  = new JTextArea();
 
         JPanel privPanel = new JPanel(new BorderLayout());
@@ -1022,6 +1043,8 @@ private JButton   browseFileOpPrivateBtn;
 
         // ── PRIVATE KEY ─────────────────────────────────────────────
         signPrivateKeyArea = new JTextArea();
+        signPrivateKeyArea.setColumns(5);
+
         JPanel privPanel = new JPanel(new BorderLayout());
         privPanel.setBorder(BorderFactory.createTitledBorder("PRIVATE KEY"));
         privPanel.add(new JScrollPane(signPrivateKeyArea), BorderLayout.CENTER);
@@ -1120,7 +1143,7 @@ private JButton   browseFileOpPrivateBtn;
             String sigB64 = Base64.getEncoder().encodeToString(sigBytes);
 
             mostRecentField.setForeground(Color.GREEN);
-            mostRecentField.setText("Signature: " + sigB64);
+            mostRecentField.setText(sigB64);
         } catch (Exception ex) {
             showError("Sign error: " + ex.getMessage());
             mostRecentField.setForeground(Color.RED);
@@ -1325,6 +1348,20 @@ private JButton   browseFileOpPrivateBtn;
       KeyWithName(String n, PublicKey pk) { name = n; publicKey = pk; }
   }
 
+
+
+    private void loadDefaultFileOpKeys() {
+        Path pub = Paths.get("publickey.pem");
+        if (Files.exists(pub)) {
+            try { fileOpPublicKeyArea.setText(Files.readString(pub)); }
+            catch (IOException ignored) {}
+        }
+        Path priv = Paths.get("privatekey.pem");
+        if (Files.exists(priv)) {
+            try { fileOpPrivateKeyArea.setText(Files.readString(priv)); }
+            catch (IOException ignored) {}
+        }
+    }
 
     private static class SimpleDocListener implements DocumentListener {
         private final Runnable r;
