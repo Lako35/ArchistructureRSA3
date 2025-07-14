@@ -49,11 +49,11 @@ public class CryptoGui extends JFrame {
 
 
     private JTextField selectedFileField;
-private JButton   selectFileBtn;
-private JTextArea fileOpPublicKeyArea;
-private JButton   browseFileOpPublicBtn;
-private JTextArea fileOpPrivateKeyArea;
-private JButton   browseFileOpPrivateBtn;
+    private JButton   selectFileBtn;
+    private JTextArea fileOpPublicKeyArea;
+    private JButton   browseFileOpPublicBtn;
+    private JTextArea fileOpPrivateKeyArea;
+    private JButton   browseFileOpPrivateBtn;
     private JTextField       digitalSignatureField;
     private JTextArea encryptPublicKeyArea;
     private JButton   browseEncryptBtn;
