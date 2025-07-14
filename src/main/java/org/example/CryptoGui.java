@@ -300,11 +300,13 @@ public class CryptoGui extends JFrame {
             @Override
             protected String doInBackground() {
                 try {
-                    byte[] data = Files.readAllBytes(Paths.get(filePath));
                     PrivateKey priv = parsePrivateKey(privText);
                     Signature sig = Signature.getInstance("SHA256withRSA");
                     sig.initSign(priv);
-                    sig.update(data);
+
+                    // stream the file rather than buffering whole thing
+                    updateSignatureFromFile(sig, Paths.get(filePath));
+
                     return Base64.getEncoder().encodeToString(sig.sign());
                 } catch (Exception e) {
                     return "ERROR: " + e.getMessage();
@@ -333,6 +335,20 @@ public class CryptoGui extends JFrame {
         }.execute();
     }
 
+
+    // helper in your class:
+    public static void updateSignatureFromFile(Signature sig, Path file) throws IOException, SignatureException {
+        try (InputStream in = Files.newInputStream(file)) {
+            byte[] buf = new byte[8192];
+            int len;
+            while ((len = in.read(buf)) != -1) {
+                sig.update(buf, 0, len);
+            }
+        }
+    }
+
+
+
     private void verifyFileOpAsync() {
         final String filePath = selectedFileField.getText().trim();
         final String sigB64   = digitalSignatureField.getText().trim();
@@ -342,15 +358,18 @@ public class CryptoGui extends JFrame {
         new SwingWorker<String, Void>() {
             @Override
             protected String doInBackground() throws Exception {
-                byte[] data     = Files.readAllBytes(Paths.get(filePath));
                 byte[] sigBytes = Base64.getDecoder().decode(sigB64);
 
+                // Try each algorithm and each key, streaming the file each time:
                 for (String algo : SIGNATURE_ALGORITHMS) {
                     for (KeyWithName kw : parsePublicKeys(keyText)) {
                         try {
                             Signature v = Signature.getInstance(algo);
                             v.initVerify(kw.publicKey);
-                            v.update(data);
+
+                            // stream the file into v.update(...)
+                            updateSignatureFromFile(v, Paths.get(filePath));
+
                             if (v.verify(sigBytes)) {
                                 return algo + " ✓ with " + kw.name;
                             }
@@ -385,6 +404,7 @@ public class CryptoGui extends JFrame {
         }.execute();
     }
 
+
     // ─────────────────────────────────────────────────────────────────────────────
 // Encrypt the selected file with the Public Key field (hybrid RSA/AES)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -394,10 +414,9 @@ public class CryptoGui extends JFrame {
         if (filePath.isEmpty() || pubText.isEmpty()) return;
 
         new SwingWorker<Void,Void>() {
-            @Override
-            protected Void doInBackground() throws Exception {
-                PublicKey pub = parsePublicKey(pubText);
-                encryptFileWithHybridRSA(filePath, pub);
+            @Override protected Void doInBackground() throws Exception {
+                PublicKey pub = parsePublicKey(fileOpPublicKeyArea.getText().trim());
+                encryptFileHybridStream(selectedFileField.getText(), pub);
                 return null;
             }
             @Override
@@ -425,10 +444,9 @@ public class CryptoGui extends JFrame {
         if (filePath.isEmpty() || privText.isEmpty()) return;
 
         new SwingWorker<Void,Void>() {
-            @Override
-            protected Void doInBackground() throws Exception {
-                PrivateKey priv = parsePrivateKey(privText);
-                decryptFileWithHybridRSA(filePath, priv);
+            @Override protected Void doInBackground() throws Exception {
+                PrivateKey priv = parsePrivateKey(fileOpPrivateKeyArea.getText().trim());
+                decryptFileHybridStream(selectedFileField.getText(), priv);
                 return null;
             }
             @Override
@@ -1370,4 +1388,123 @@ public class CryptoGui extends JFrame {
         @Override public void removeUpdate(DocumentEvent e) { r.run(); }
         @Override public void changedUpdate(DocumentEvent e) { r.run(); }
     }
+
+    public static void encryptFileHybridStream(String inputPath, PublicKey rsaPub) throws Exception {
+        Path in  = Paths.get(inputPath);
+        Path dir = in.getParent();
+        String name = in.getFileName().toString();
+        Path out = dir.resolve("ENCRYPTED-" + name);
+
+        // 1) Generate a random AES key + IV
+        KeyGenerator kg = KeyGenerator.getInstance("AES");
+        kg.init(256);
+        SecretKey aesKey = kg.generateKey();
+        byte[] iv = new byte[12];
+        new SecureRandom().nextBytes(iv);
+        GCMParameterSpec gcmSpec = new GCMParameterSpec(128, iv);
+
+        // 2) Wrap the AES key with RSA
+        Cipher rsa = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+        rsa.init(Cipher.ENCRYPT_MODE, rsaPub);
+        byte[] wrappedKey = rsa.doFinal(aesKey.getEncoded());
+
+        // 3) Prepare AES/GCM cipher
+        Cipher aes = Cipher.getInstance("AES/GCM/NoPadding");
+        aes.init(Cipher.ENCRYPT_MODE, aesKey, gcmSpec);
+
+        // 4) Stream: [key-len][wrappedKey][iv-len][iv][ciphertext...]
+        try (DataOutputStream dos = new DataOutputStream(Files.newOutputStream(out));
+             FileInputStream fis    = new FileInputStream(in.toFile());
+             CipherOutputStream cos = new CipherOutputStream(dos, aes)) {
+
+            dos.writeInt(wrappedKey.length);
+            dos.write(wrappedKey);
+            dos.writeInt(iv.length);
+            dos.write(iv);
+
+            byte[] buf = new byte[8192];
+            int read;
+            while ((read = fis.read(buf)) != -1) {
+                cos.write(buf, 0, read);
+            }
+        }
+    }
+
+    public static void decryptFileHybridStream(String inputPath, PrivateKey rsaPriv) throws Exception {
+        Path in  = Paths.get(inputPath);
+        Path dir = in.getParent();
+        String name = in.getFileName().toString();
+        Path out = dir.resolve("DECRYPTED-" + name);
+
+        try (DataInputStream dis = new DataInputStream(Files.newInputStream(in))) {
+            // 1) Unwrap AES key
+            int keyLen = dis.readInt();
+            byte[] wrappedKey = new byte[keyLen];
+            dis.readFully(wrappedKey);
+            int ivLen = dis.readInt();
+            byte[] iv = new byte[ivLen];
+            dis.readFully(iv);
+
+            Cipher rsa = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+            rsa.init(Cipher.DECRYPT_MODE, rsaPriv);
+            byte[] aesBytes = rsa.doFinal(wrappedKey);
+            SecretKeySpec aesKey = new SecretKeySpec(aesBytes, "AES");
+
+            // 2) AES/GCM decrypt stream
+            Cipher aes = Cipher.getInstance("AES/GCM/NoPadding");
+            aes.init(Cipher.DECRYPT_MODE, aesKey, new GCMParameterSpec(128, iv));
+
+            try (CipherInputStream cis = new CipherInputStream(dis, aes);
+                 FileOutputStream fos = new FileOutputStream(out.toFile())) {
+
+                byte[] buf = new byte[8192];
+                int read;
+                while ((read = cis.read(buf)) != -1) {
+                    fos.write(buf, 0, read);
+                }
+            }
+        }
+    }
+
+
+    /**
+     * Stream-sign a file using the given private key and return the signature bytes.
+     */
+    public static byte[] signFileStream(String inputPath, PrivateKey priv) throws Exception {
+        Signature signer = Signature.getInstance("SHA256withRSA");
+        signer.initSign(priv);
+
+        try (InputStream in = Files.newInputStream(Paths.get(inputPath))) {
+            byte[] buf = new byte[8192];
+            int len;
+            while ((len = in.read(buf)) != -1) {
+                signer.update(buf, 0, len);
+            }
+        }
+
+        return signer.sign();
+    }
+
+    /**
+     * Stream-verify a file against a Base64-encoded signature.
+     * Returns true if verification succeeds.
+     */
+    public static boolean verifyFileStream(String inputPath,
+                                           String sigB64,
+                                           PublicKey pub) throws Exception {
+        Signature verifier = Signature.getInstance("SHA256withRSA");
+        verifier.initVerify(pub);
+
+        try (InputStream in = Files.newInputStream(Paths.get(inputPath))) {
+            byte[] buf = new byte[8192];
+            int len;
+            while ((len = in.read(buf)) != -1) {
+                verifier.update(buf, 0, len);
+            }
+        }
+
+        byte[] sigBytes = Base64.getDecoder().decode(sigB64);
+        return verifier.verify(sigBytes);
+    }
+
 }
