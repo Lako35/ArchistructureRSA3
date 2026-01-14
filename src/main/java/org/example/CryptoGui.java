@@ -37,8 +37,47 @@ import java.security.spec.RSAPublicKeySpec;
 import java.util.Base64;
 import java.util.Random;
 
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
+import java.nio.file.StandardCopyOption;
+import java.util.Arrays;
+
 
 public class CryptoGui extends JFrame {
+
+
+
+    // Hardcode this. This is a Base64 string containing JSON with KDF params + wrapped DEK.
+// (Generator snippet is included at the bottom of this answer.)
+    private static final String VAULT_DEFAULT_ENCRYPTED_KEY_B64 =
+            "eyJjdCI6Ii90M1l4YzlqWGxXZGJEQ2VZdDVtaWx0Z25iS1RtY0ptRTRXTHMyV0VqRUh1OG91Y242MGdKQno5SGcxSUZ5V20iLCJzYWx0IjoiYTJ0eVZSeTFpSUxTcXFCdzFWcjltUT09IiwidiI6MSwiaXRlciI6NjAwMDAwLCJrZGYiOiJQQktERjJXaXRoSG1hY1NIQTI1NiIsIml2Ijoiak1rdnYwb1hkNXFPK0F0ciJ9";
+
+    // vault.txt location (you asked for vault.txt specifically)
+    private static final Path VAULT_PATH = Paths.get("vault.txt");
+
+    // Autosave after 5 seconds of inactivity
+    private static final int VAULT_AUTOSAVE_DELAY_MS = 5000;
+
+
+    // UI
+    private JTextArea vaultEncryptedKeyArea;
+    private JPasswordField vaultPasswordField;
+    private JTextArea vaultContentsArea;
+
+    // Timers
+    private javax.swing.Timer vaultAutosaveTimer;
+    private javax.swing.Timer vaultUnlockDebounceTimer;
+
+    // State
+    private volatile boolean vaultUnlocked = false;
+    private volatile boolean vaultProgrammaticChange = false;
+    private byte[] vaultDek = null; // 32 bytes (AES-256) in memory while unlocked
+
+    // Track current card so we can lock on leaving Vault
+    private String currentCardName = "";
+    
+    
+    
 
     private boolean encryptKeyLoaded = false;
     private boolean verifyKeyLoaded  = false;
@@ -46,6 +85,8 @@ public class CryptoGui extends JFrame {
     private boolean decryptKeyLoaded = false;
     private boolean fileOpKeysLoaded = false;
 
+    
+    
 
 
     private JTextField selectedFileField;
@@ -495,7 +536,7 @@ public class CryptoGui extends JFrame {
 
     private void initMenu() {
         JMenuBar menuBar = new JMenuBar();
-        String[] modes = { "Generate Keypair", "Sign", "Verify", "Encrypt", "Decrypt", "File Operations" };        for (String mode : modes) {
+        String[] modes = { "Generate Keypair", "Sign", "Verify", "Encrypt", "Decrypt", "File Operations", "Vault" };        for (String mode : modes) {
             JMenuItem item = new JMenuItem(mode);
             item.addActionListener(e -> showCard(mode));
             menuBar.add(item);
@@ -512,11 +553,323 @@ public class CryptoGui extends JFrame {
         cardPanel.add(createEncryptPanel(), "Encrypt");
         cardPanel.add(createDecryptPanel(), "Decrypt");
         cardPanel.add(createFileOperationsPanel(), "File Operations");
+        cardPanel.add(createVaultPanel(), "Vault");
+
         add(cardPanel, BorderLayout.CENTER);
         showCard("Generate Keypair");
     }
 
+
+    private JPanel createVaultPanel() {
+        JPanel panel = new JPanel(new BorderLayout(10, 10));
+
+        // 1) Default Encrypted Key (display-only)
+        vaultEncryptedKeyArea = new JTextArea();
+        vaultEncryptedKeyArea.setLineWrap(true);
+        vaultEncryptedKeyArea.setWrapStyleWord(true);
+        vaultEncryptedKeyArea.setEditable(false);
+        JScrollPane keyScroll = new JScrollPane(vaultEncryptedKeyArea);
+        keyScroll.setBorder(BorderFactory.createTitledBorder("Default Encrypted Key"));
+
+        // 2) Password
+        vaultPasswordField = new JPasswordField();
+        vaultPasswordField.setBorder(BorderFactory.createTitledBorder("Password"));
+
+        // 3) Contents (locked until unlock)
+        vaultContentsArea = new JTextArea();
+        vaultContentsArea.setLineWrap(true);
+        vaultContentsArea.setWrapStyleWord(true);
+        vaultContentsArea.setEditable(false);
+        JScrollPane contentScroll = new JScrollPane(vaultContentsArea);
+        contentScroll.setBorder(BorderFactory.createTitledBorder("Contents"));
+
+        // Layout: top stack key + password, then contents
+        JPanel top = new JPanel(new BorderLayout(8, 8));
+        top.add(keyScroll, BorderLayout.CENTER);
+        top.add(vaultPasswordField, BorderLayout.SOUTH);
+
+        panel.add(top, BorderLayout.NORTH);
+        panel.add(contentScroll, BorderLayout.CENTER);
+
+        // Debounce unlock attempts while typing password (400ms after last keystroke)
+        vaultUnlockDebounceTimer = new javax.swing.Timer(400, e -> tryUnlockVaultAsync());
+        vaultUnlockDebounceTimer.setRepeats(false);
+
+        vaultPasswordField.getDocument().addDocumentListener(new SimpleDocListener(() -> {
+            clearStatus();
+            if (vaultUnlockDebounceTimer != null) vaultUnlockDebounceTimer.restart();
+        }));
+
+        // Autosave timer (5s after last user edit)
+        vaultAutosaveTimer = new javax.swing.Timer(VAULT_AUTOSAVE_DELAY_MS, e -> saveVaultAsync());
+        vaultAutosaveTimer.setRepeats(false);
+
+        vaultContentsArea.getDocument().addDocumentListener(new SimpleDocListener(() -> {
+            if (!vaultUnlocked) return;
+            if (vaultProgrammaticChange) return; // ignore setText() from code
+            // Only save when user is actually editing the contents area
+            if (!vaultContentsArea.isFocusOwner()) return;
+
+            vaultAutosaveTimer.restart();
+            // Optional: tiny UI hint (no logs)
+            statusBar.setForeground(Color.BLACK);
+            statusBar.setText("Autosave pending…");
+        }));
+
+        // Start locked
+        lockVault();
+        vaultEncryptedKeyArea.setText(VAULT_DEFAULT_ENCRYPTED_KEY_B64);
+
+        return panel;
+    }
+
+    private void lockVault() {
+        // stop timers
+        if (vaultAutosaveTimer != null) vaultAutosaveTimer.stop();
+        if (vaultUnlockDebounceTimer != null) vaultUnlockDebounceTimer.stop();
+
+        // wipe DEK
+        if (vaultDek != null) {
+            Arrays.fill(vaultDek, (byte) 0);
+            vaultDek = null;
+        }
+
+        vaultUnlocked = false;
+
+        // clear UI
+        vaultProgrammaticChange = true;
+        try {
+            if (vaultPasswordField != null) vaultPasswordField.setText("");
+            if (vaultContentsArea != null) {
+                vaultContentsArea.setText("");
+                vaultContentsArea.setEditable(false);
+            }
+        } finally {
+            vaultProgrammaticChange = false;
+        }
+    }
+
+    private void tryUnlockVaultAsync() {
+        final char[] password = vaultPasswordField.getPassword();
+        if (password == null || password.length == 0) {
+            // still locked, no error spam
+            return;
+        }
+
+        new SwingWorker<String, Void>() {
+            byte[] dekLocal = null;
+            String contentsLocal = null;
+
+            @Override
+            protected String doInBackground() {
+                try {
+                    dekLocal = unwrapVaultDek(VAULT_DEFAULT_ENCRYPTED_KEY_B64, password);
+                    contentsLocal = decryptVaultFile(dekLocal);
+                    return "OK";
+                } catch (Exception ex) {
+                    return "ERROR: " + ex.getMessage();
+                } finally {
+                    // wipe password ASAP
+                    Arrays.fill(password, '\0');
+                }
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    String res = get();
+                    if (!"OK".equals(res)) {
+                        // remain locked; do not spam stack traces
+                        if (dekLocal != null) Arrays.fill(dekLocal, (byte) 0);
+
+                        vaultUnlocked = false;
+                        vaultProgrammaticChange = true;
+                        try {
+                            vaultContentsArea.setText("");
+                            vaultContentsArea.setEditable(false);
+                        } finally {
+                            vaultProgrammaticChange = false;
+                        }
+
+                        statusBar.setForeground(Color.RED);
+                        statusBar.setText("Wrong password or invalid vault key");
+                        mostRecentField.setForeground(Color.RED);
+                        mostRecentField.setText("");
+                        return;
+                    }
+
+                    // success -> install DEK into state (wipe old first)
+                    if (vaultDek != null) Arrays.fill(vaultDek, (byte) 0);
+                    vaultDek = dekLocal;
+                    vaultUnlocked = true;
+
+                    vaultProgrammaticChange = true;
+                    try {
+                        vaultContentsArea.setText(contentsLocal == null ? "" : contentsLocal);
+                        vaultContentsArea.setEditable(true);
+                    } finally {
+                        vaultProgrammaticChange = false;
+                    }
+
+                    mostRecentField.setForeground(Color.GREEN);
+                    mostRecentField.setText("Vault unlocked");
+                    statusBar.setForeground(Color.GREEN);
+                    statusBar.setText("Unlocked");
+                } catch (Exception e) {
+                    statusBar.setForeground(Color.RED);
+                    statusBar.setText("Unlock error: " + e.getMessage());
+                }
+            }
+        }.execute();
+    }
+
+    /**
+     * Unwrap the Data Encryption Key (DEK) from VAULT_DEFAULT_ENCRYPTED_KEY_B64 using the given password.
+     *
+     * Expected format of VAULT_DEFAULT_ENCRYPTED_KEY_B64:
+     * Base64( JSON ):
+     * {
+     *   "v":1,
+     *   "kdf":"PBKDF2WithHmacSHA256",
+     *   "iter":600000,
+     *   "salt":"<b64>",
+     *   "iv":"<b64>",
+     *   "ct":"<b64>"   // AES-GCM encrypted 32-byte DEK
+     * }
+     */
+    private byte[] unwrapVaultDek(String wrappedKeyB64, char[] password) throws Exception {
+        String json = new String(Base64.getDecoder().decode(wrappedKeyB64.trim()), StandardCharsets.UTF_8);
+        JSONObject obj = new JSONObject(json);
+
+        int v = obj.getInt("v");
+        if (v != 1) throw new IllegalArgumentException("Unsupported vault key version: " + v);
+
+        String kdf = obj.getString("kdf");
+        if (!"PBKDF2WithHmacSHA256".equalsIgnoreCase(kdf)) {
+            throw new IllegalArgumentException("Unsupported KDF: " + kdf);
+        }
+
+        int iter = obj.getInt("iter");
+        byte[] salt = Base64.getDecoder().decode(obj.getString("salt"));
+        byte[] iv   = Base64.getDecoder().decode(obj.getString("iv"));
+        byte[] ct   = Base64.getDecoder().decode(obj.getString("ct"));
+
+        // Derive KEK from password
+        PBEKeySpec spec = new PBEKeySpec(password, salt, iter, 256);
+        SecretKeyFactory skf = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+        byte[] kekBytes = skf.generateSecret(spec).getEncoded();
+        SecretKeySpec kek = new SecretKeySpec(kekBytes, "AES");
+
+        try {
+            Cipher aes = Cipher.getInstance("AES/GCM/NoPadding");
+            aes.init(Cipher.DECRYPT_MODE, kek, new GCMParameterSpec(128, iv));
+            byte[] dek = aes.doFinal(ct);
+            if (dek.length != 32) throw new IllegalArgumentException("DEK length invalid: " + dek.length);
+            return dek;
+        } finally {
+            Arrays.fill(kekBytes, (byte) 0);
+            spec.clearPassword();
+        }
+    }
+
+    /**
+     * vault.txt format (JSON, plaintext on disk is NOT stored):
+     * {
+     *   "v":1,
+     *   "iv":"<b64>",
+     *   "ct":"<b64>"
+     * }
+     *
+     * If vault.txt doesn't exist, returns empty string.
+     */
+    private String decryptVaultFile(byte[] dek) throws Exception {
+        if (!Files.exists(VAULT_PATH)) return "";
+
+        String raw = Files.readString(VAULT_PATH, StandardCharsets.UTF_8).trim();
+        if (raw.isEmpty()) return "";
+
+        JSONObject obj = new JSONObject(raw);
+        int v = obj.getInt("v");
+        if (v != 1) throw new IllegalArgumentException("Unsupported vault file version: " + v);
+
+        byte[] iv = Base64.getDecoder().decode(obj.getString("iv"));
+        byte[] ct = Base64.getDecoder().decode(obj.getString("ct"));
+
+        Cipher aes = Cipher.getInstance("AES/GCM/NoPadding");
+        SecretKeySpec key = new SecretKeySpec(dek, "AES");
+        aes.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(128, iv));
+
+        byte[] plain = aes.doFinal(ct);
+        return new String(plain, StandardCharsets.UTF_8);
+    }
+
+    private void saveVaultAsync() {
+        if (!vaultUnlocked || vaultDek == null) return;
+
+        final String contents = vaultContentsArea.getText();
+        final byte[] dekSnapshot = Arrays.copyOf(vaultDek, vaultDek.length);
+
+        new SwingWorker<String, Void>() {
+            @Override
+            protected String doInBackground() {
+                try {
+                    writeEncryptedVaultFile(dekSnapshot, contents);
+                    return "OK";
+                } catch (Exception e) {
+                    return "ERROR: " + e.getMessage();
+                } finally {
+                    Arrays.fill(dekSnapshot, (byte) 0);
+                }
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    String res = get();
+                    if ("OK".equals(res)) {
+                        mostRecentField.setForeground(Color.GREEN);
+                        mostRecentField.setText("Saved vault.txt");
+                        statusBar.setForeground(Color.BLACK);
+                        statusBar.setText("Saved");
+                    } else {
+                        statusBar.setForeground(Color.RED);
+                        statusBar.setText("Vault save failed");
+                    }
+                } catch (Exception e) {
+                    statusBar.setForeground(Color.RED);
+                    statusBar.setText("Vault save error: " + e.getMessage());
+                }
+            }
+        }.execute();
+    }
+
+    private void writeEncryptedVaultFile(byte[] dek, String plaintext) throws Exception {
+        byte[] iv = new byte[12];
+        new SecureRandom().nextBytes(iv);
+
+        Cipher aes = Cipher.getInstance("AES/GCM/NoPadding");
+        SecretKeySpec key = new SecretKeySpec(dek, "AES");
+        aes.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(128, iv));
+
+        byte[] ct = aes.doFinal(plaintext.getBytes(StandardCharsets.UTF_8));
+
+        JSONObject obj = new JSONObject();
+        obj.put("v", 1);
+        obj.put("iv", Base64.getEncoder().encodeToString(iv));
+        obj.put("ct", Base64.getEncoder().encodeToString(ct));
+
+        // atomic-ish write: temp -> move
+        Path tmp = Paths.get(VAULT_PATH.toString() + ".tmp");
+        Files.writeString(tmp, obj.toString(), StandardCharsets.UTF_8);
+        Files.move(tmp, VAULT_PATH, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+    }
+
     private void showCard(String name) {
+
+        if ("Vault".equals(currentCardName) && !"Vault".equals(name)) {
+            lockVault();
+        }
+        
         cardLayout.show(cardPanel, name);
         clearStatus();
 
