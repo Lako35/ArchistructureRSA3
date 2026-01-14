@@ -108,7 +108,7 @@ public class CryptoGui extends JFrame {
 
         byte[] fileBytes = Files.readAllBytes(in);
 
-        // 1) generate AES key
+        // 1) act AES key
         KeyGenerator kg = KeyGenerator.getInstance("AES");
         kg.init(256);
         SecretKey aesKey = kg.generateKey();
@@ -362,6 +362,7 @@ public class CryptoGui extends JFrame {
 
                 // Try each algorithm and each key, streaming the file each time:
                 for (String algo : SIGNATURE_ALGORITHMS) {
+                    try {
                     for (KeyWithName kw : parsePublicKeys(keyText)) {
                         try {
                             Signature v = Signature.getInstance(algo);
@@ -374,7 +375,8 @@ public class CryptoGui extends JFrame {
                                 return algo + " ✓ with " + kw.name;
                             }
                         } catch (Exception ignored) { }
-                    }
+                    } } catch (Exception ignored) {}
+                    
                 }
                 return null;
             }
@@ -1257,7 +1259,7 @@ public class CryptoGui extends JFrame {
         final String text    = textToVerifyArea.getText();
         final String sigB64  = signatureField.getText().trim();
         final String keyText = verifyPublicKeyArea.getText();
-        if (sigB64.isEmpty() || keyText.trim().isEmpty()) return;
+        if (sigB64.isEmpty()) return; // allow /keys to be used even if textarea is blank
 
         new SwingWorker<String, Void>() {
             @Override
@@ -1266,17 +1268,20 @@ public class CryptoGui extends JFrame {
                     byte[] sigBytes = Base64.getDecoder().decode(sigB64);
                     byte[] data     = text.getBytes(StandardCharsets.UTF_8);
 
-                    for (String algo : SIGNATURE_ALGORITHMS) {
-                        for (KeyWithName kw : parsePublicKeys(keyText)) {
-                            try {
-                                Signature v = Signature.getInstance(algo);
-                                v.initVerify(kw.publicKey);
-                                v.update(data);
-                                if (v.verify(sigBytes)) {
-                                    return algo + " ✓ verified with " + kw.name;
+                    for (String algo : SIGNATURE_ALGORITHMS) { 
+                        try {
+                            for (KeyWithName kw : parsePublicKeys(keyText)) {
+                                try {
+                                    Signature v = Signature.getInstance(algo);
+                                    v.initVerify(kw.publicKey);
+                                    v.update(data);
+                                    if (v.verify(sigBytes)) {
+                                        return algo + " ✓ verified with " + kw.name;
+                                    }
+                                } catch (Exception ignored) {
                                 }
-                            } catch (Exception ignored) { }
-                        }
+                            }
+                        } catch (Exception ignored) {}
                     }
                     return "NOT VERIFIED";
                 } catch (Exception ex) {
@@ -1312,42 +1317,67 @@ public class CryptoGui extends JFrame {
     }
 
           // parse either a single PEM/Base64 key or a JSON envelope {"keys":[{name,public},…]}
-          private List<KeyWithName> parsePublicKeys(String keyText) throws Exception {
+          private List<KeyWithName> parsePublicKeys(String keyText) {
               List<KeyWithName> result = new ArrayList<>();
+              String t = (keyText == null) ? "" : keyText.trim();
 
-              // Parse keys from the text area (single key or JSON envelope)
-              keyText = keyText.trim();
-              if (keyText.startsWith("{")) {
-                  JSONObject obj = new JSONObject(keyText);
-                  JSONArray arr = obj.getJSONArray("keys");
-                  for (int i = 0; i < arr.length(); i++) {
-                      JSONObject e = arr.getJSONObject(i);
-                      String name = e.optString("name", "key" + i);
-                      String pub  = e.getString("public");
-                      result.add(new KeyWithName(name, parsePublicKey(pub)));
+              // 1) FIRST: keys from textarea (single key or JSON envelope) — but never throw
+              if (!t.isEmpty()) {
+                  if (t.startsWith("{")) {
+                      try {
+                          JSONObject obj = new JSONObject(t);
+                          JSONArray arr = obj.optJSONArray("keys");
+                          if (arr != null) {
+                              for (int i = 0; i < arr.length(); i++) {
+                                  JSONObject e = arr.optJSONObject(i);
+                                  if (e == null) continue;
+
+                                  String name = e.optString("name", "key" + i);
+                                  String pub  = e.optString("public", "").trim();
+                                  if (pub.isEmpty()) continue;
+
+                                  try {
+                                      result.add(new KeyWithName(name, parsePublicKey(pub)));
+                                  } catch (Exception ignored) {
+                                      // bad key entry; skip
+                                  }
+                              }
+                          }
+                      } catch (Exception ignored) {
+                          // bad JSON; skip textarea and continue to /keys
+                      }
+                  } else {
+                      try {
+                          result.add(new KeyWithName("input", parsePublicKey(t)));
+                      } catch (Exception ignored) {
+                          // bad typed key; skip and continue to /keys
+                      }
                   }
-              } else if (!keyText.isEmpty()) {
-                  result.add(new KeyWithName("publickey.pem", parsePublicKey(keyText)));
               }
 
-              // Also load all public key files under /keys (*.pem or *.b64)
+              // 2) THEN: load /keys/*.pem and /keys/*.b64, skipping unreadable/unparseable files
               Path keyDir = Paths.get("keys");
               if (Files.isDirectory(keyDir)) {
-                  try (DirectoryStream<Path> ds = Files.newDirectoryStream(keyDir, "*.{pem,b64}")) {
+                  try (DirectoryStream<Path> ds = Files.newDirectoryStream(keyDir)) {
                       for (Path p : ds) {
+                          String fn = p.getFileName().toString().toLowerCase();
+
                           try {
                               String content = Files.readString(p);
                               PublicKey pk = parsePublicKey(content);
                               result.add(new KeyWithName(p.getFileName().toString(), pk));
                           } catch (Exception ignored) {
-                              // skip files that can't be parsed
+                              // skip bad file
                           }
                       }
+                  } catch (Exception ignored) {
+                      // can't read dir; just return what we have
                   }
               }
 
               return result;
           }
+
 
     /** Strips PEM headers (if present), Base64-decodes, and builds an RSA PublicKey. */
     private PublicKey parsePublicKey(String text) throws Exception {

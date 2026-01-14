@@ -3,6 +3,7 @@ package org.example;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 
 import java.io.*;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -14,14 +15,80 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import javax.crypto.*;
-import javax.crypto.spec.IvParameterSpec;
-import javax.crypto.spec.SecretKeySpec;
+import javax.crypto.spec.*;
 import java.nio.charset.StandardCharsets;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class Main {
 
+    // RFC 3526 MODP Group 14 (2048-bit) prime (hex) and generator g=2
+    private static final BigInteger DH_P_GROUP14 = new BigInteger(
+            "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1" +
+                    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD" +
+                    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245" +
+                    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED" +
+                    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381" +
+                    "FFFFFFFFFFFFFFFF", 16);
+    private static final BigInteger DH_G_GROUP14 = BigInteger.valueOf(2);
+
+    /** simple hex encoder */
+    private static String toHex(byte[] b) {
+        StringBuilder sb = new StringBuilder(b.length * 2);
+        for (byte x : b) sb.append(String.format("%02x", x));
+        return sb.toString();
+    }
+
+    /** parse BigInteger from hex (0x… or contains A–F) or decimal input */
+    private static BigInteger parseBigIntFlexible(String s) {
+        String t = s.trim();
+        if (t.startsWith("0x") || t.startsWith("0X")) {
+            return new BigInteger(t.substring(2), 16);
+        }
+        // if looks like hex (has hex letters), parse as hex; else decimal
+        if (t.matches("(?i).*[A-F].*")) return new BigInteger(t, 16);
+        return new BigInteger(t, 10);
+    }
+
+
+    private static String b64(byte[] x) {
+        return Base64.getEncoder().encodeToString(x);
+    }
+
+    /** HKDF-Extract (HMAC-SHA-256) */
+    private static byte[] hkdfExtract(byte[] salt, byte[] ikm) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(salt, "HmacSHA256"));
+        return mac.doFinal(ikm);
+    }
+
+    /** HKDF-Expand (HMAC-SHA-256) to L bytes */
+    private static byte[] hkdfExpand(byte[] prk, byte[] info, int L) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(prk, "HmacSHA256"));
+        byte[] t = new byte[0];
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int ctr = 1;
+        while (out.size() < L) {
+            mac.reset();
+            mac.update(t);
+            mac.update(info);
+            mac.update((byte) ctr);
+            t = mac.doFinal();
+            out.write(t);
+            ctr++;
+        }
+        byte[] okm = out.toByteArray();
+        return Arrays.copyOf(okm, L);
+    }
+
+    /** HKDF-Extract+Expand (salt, ikm, info) -> L bytes */
+    private static byte[] hkdf(byte[] salt, byte[] ikm, byte[] info, int L) throws Exception {
+        byte[] prk = hkdfExtract(salt, ikm);
+        return hkdfExpand(prk, info, L);
+    }
+    
+    
     static {
         Security.addProvider(new BouncyCastleProvider());
     }
@@ -32,6 +99,182 @@ public class Main {
             "SHA512withRSA", "MD2withRSA", "MD5withRSA"
     };
 
+
+
+    private static void doManualDH(Scanner scanner) throws Exception {
+        System.out.println("=== Manual Diffie–Hellman (MODP Group 14: 2048-bit, g=2) ===");
+        System.out.println("NOTE: You should exchange ONLY DH public values (Y = g^x mod p), NEVER your private exponent.");
+
+        // 1) Set parameters
+        DHParameterSpec params = new DHParameterSpec(DH_P_GROUP14, DH_G_GROUP14);
+
+        // 2) Generate our ephemeral DH keypair
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("DH");
+        kpg.initialize(params, new SecureRandom());
+        KeyPair myKP = kpg.generateKeyPair();
+
+        // 3) Compute & display our public value Y = g^x mod p
+        //    We can either pull Y from the public key or recompute via BigInteger (the key already has it)
+        KeyFactory kf = KeyFactory.getInstance("DH");
+        // Extract Y by converting to spec
+        DHPublicKeySpec myPubSpec = kf.getKeySpec(myKP.getPublic(), DHPublicKeySpec.class);
+        BigInteger myY = myPubSpec.getY();
+
+        byte[] myYBytes = myY.toByteArray();
+        System.out.println("\nYour DH public value (share this with the other party):");
+        System.out.println("  HEX: " + toHex(myYBytes));
+        System.out.println("  DEC: " + myY.toString(10));
+
+        // 4) Prompt for the other party's public value (Y_other)
+        System.out.print("\nPaste OTHER party's DH public value Y (hex like 0xABC... or decimal): ");
+        String peerStr = scanner.nextLine().trim();
+        BigInteger peerY;
+        try {
+            peerY = parseBigIntFlexible(peerStr);
+        } catch (Exception e) {
+            System.err.println("Could not parse the other party's public value.");
+            return;
+        }
+
+        // 5) Validate basic range: 2 <= Y <= p-2
+        if (peerY.compareTo(BigInteger.TWO) < 0 || peerY.compareTo(DH_P_GROUP14.subtract(BigInteger.TWO)) > 0) {
+            System.err.println("Invalid peer public value: out of safe range.");
+            return;
+        }
+
+        // 6) Build a PublicKey object from peerY and perform DH
+        PublicKey peerPubKey = kf.generatePublic(new DHPublicKeySpec(peerY, DH_P_GROUP14, DH_G_GROUP14));
+
+        KeyAgreement ka = KeyAgreement.getInstance("DH");
+        ka.init(myKP.getPrivate());
+        ka.doPhase(peerPubKey, true);
+
+        byte[] sharedSecret = ka.generateSecret(); // raw DH shared secret (length ~ 256 bytes for 2048-bit group)
+
+        // 7) Display the shared secret (hex) and a derived 256-bit key (SHA-256 of secret)
+        System.out.println("\nShared secret (raw DH output):");
+        System.out.println("  HEX: " + toHex(sharedSecret));
+
+        MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+        byte[] k256 = sha256.digest(sharedSecret); // simple KDF for demo; consider HKDF in production
+        System.out.println("\nDerived symmetric key (SHA-256(sharedSecret), 32 bytes):");
+        System.out.println("  BASE64: " + toHex(k256));
+
+        System.out.println("\nDone. You and the other party should see the SAME shared secret / derived key.");
+        // === Step 7A: Seal (encrypt) our long-term RSA public key with HKDF→AES-GCM and print JSON ===
+        try {
+            PublicKey myLongTermPub = loadDefaultPublicKey();           // uses your existing helper
+            byte[] pubDer = myLongTermPub.getEncoded();
+
+            byte[] salt = new byte[16]; new SecureRandom().nextBytes(salt);
+            byte[] info = "PUBKEY-EXCHANGE-1".getBytes(StandardCharsets.UTF_8);
+            byte[] aesKeyBytes = hkdf(salt, sharedSecret, info, 32);
+            SecretKeySpec aesKey = new SecretKeySpec(aesKeyBytes, "AES");
+
+            byte[] nonce = new byte[12]; new SecureRandom().nextBytes(nonce);
+            Cipher gcmEnc = Cipher.getInstance("AES/GCM/NoPadding");
+            gcmEnc.init(Cipher.ENCRYPT_MODE, aesKey, new GCMParameterSpec(128, nonce));
+            String aadStr = "PUBKEY|" + myLongTermPub.getAlgorithm();
+            gcmEnc.updateAAD(aadStr.getBytes(StandardCharsets.UTF_8));
+            byte[] ct = gcmEnc.doFinal(pubDer);
+
+            String myFp = Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(MessageDigest.getInstance("SHA-256").digest(pubDer));
+
+            String envelope = "{"
+                    + "\"type\":\"pubkey-exchange\","
+                    + "\"alg\":\"AES-GCM-256\","
+                    + "\"salt\":\""  + b64(salt)  + "\","
+                    + "\"nonce\":\"" + b64(nonce) + "\","
+                    + "\"aad\":\""   + b64(aadStr.getBytes(StandardCharsets.UTF_8)) + "\","
+                    + "\"ct\":\""    + b64(ct)    + "\","
+                    + "\"fp\":\""    + myFp       + "\""
+                    + "}";
+
+            System.out.println("\n=== Step 7A: Send this encrypted public key JSON to the peer ===");
+            System.out.println(envelope);
+
+        } catch (Exception e) {
+            System.err.println("Failed to seal our public key: " + e.getMessage());
+            return;
+        }
+
+        // === Step 7B: Prompt for peer's envelope, decrypt it, and save to keys/peer-<fp>.pem ===
+        System.out.print("\nPaste OTHER party's encrypted public key JSON (press Enter to skip): ");
+        String peerJson = scanner.nextLine().trim();
+        if (peerJson.isEmpty()) {
+            System.out.println("Skipped receiving peer public key.");
+            return;
+        }
+
+        try {
+            // extract using light regex (consistent with your style elsewhere)
+            Matcher mSalt  = Pattern.compile("\"salt\"\\s*:\\s*\"([A-Za-z0-9+/=]+)\"").matcher(peerJson);
+            Matcher mNonce = Pattern.compile("\"nonce\"\\s*:\\s*\"([A-Za-z0-9+/=]+)\"").matcher(peerJson);
+            Matcher mAAD   = Pattern.compile("\"aad\"\\s*:\\s*\"([A-Za-z0-9+/=]+)\"").matcher(peerJson);
+            Matcher mCT    = Pattern.compile("\"ct\"\\s*:\\s*\"([A-Za-z0-9+/=]+)\"").matcher(peerJson);
+            Matcher mFP    = Pattern.compile("\"fp\"\\s*:\\s*\"([^\"]+)\"").matcher(peerJson);
+
+            if (!(mSalt.find() && mNonce.find() && mAAD.find() && mCT.find()))
+                throw new IllegalArgumentException("Invalid envelope fields.");
+
+            byte[] salt  = Base64.getDecoder().decode(mSalt.group(1));
+            byte[] nonce = Base64.getDecoder().decode(mNonce.group(1));
+            byte[] aad   = Base64.getDecoder().decode(mAAD.group(1));
+            byte[] ct    = Base64.getDecoder().decode(mCT.group(1));
+            String peerFpFromJson = mFP.find() ? mFP.group(1) : null;
+
+            byte[] info = "PUBKEY-EXCHANGE-1".getBytes(StandardCharsets.UTF_8);
+            byte[] aesKeyBytes = hkdf(salt, sharedSecret, info, 32);
+            SecretKeySpec aesKey = new SecretKeySpec(aesKeyBytes, "AES");
+
+            Cipher gcmDec = Cipher.getInstance("AES/GCM/NoPadding");
+            gcmDec.init(Cipher.DECRYPT_MODE, aesKey, new GCMParameterSpec(128, nonce));
+            gcmDec.updateAAD(aad);
+            byte[] peerPubDer = gcmDec.doFinal(ct);
+
+            // sanity: parse as RSA PublicKey
+            PublicKey peerPub = KeyFactory.getInstance("RSA")
+                    .generatePublic(new X509EncodedKeySpec(peerPubDer));
+
+            // fingerprint (computed locally)
+            String peerFpLocal = Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(MessageDigest.getInstance("SHA-256").digest(peerPubDer));
+
+            if (peerFpFromJson != null && !peerFpFromJson.equals(peerFpLocal)) {
+                System.out.println("Warning: envelope fingerprint != computed fingerprint. Using computed one.");
+            }
+
+            Files.createDirectories(Paths.get("keys"));
+            Path out = Paths.get("keys", "peer-" + peerFpLocal + ".pem");
+            Files.writeString(out, toArmoredPEM(peerPubDer), StandardCharsets.UTF_8);
+
+            System.out.println("\nDecrypted and saved peer public key → " + out);
+            System.out.println("Fingerprint: " + peerFpLocal);
+
+        } catch (Exception e) {
+            System.err.println("Failed to decrypt/store peer public key: " + e.getMessage());
+        }
+
+    }
+
+
+    private static String wrap64(String b64) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < b64.length(); i += 64) {
+            sb.append(b64, i, Math.min(i + 64, b64.length())).append('\n');
+        }
+        return sb.toString();
+    }
+
+    private static String toArmoredPEM(byte[] der) {
+        String b64 = Base64.getEncoder().encodeToString(der);
+        return "-----BEGIN PUBLIC KEY-----\n" + wrap64(b64) + "-----END PUBLIC KEY-----\n";
+    }
+
+    
+    
+
     public static void main(String[] args) throws Exception {
         // ensure required directories exist
         Files.createDirectories(Paths.get("keys"));
@@ -40,10 +283,13 @@ public class Main {
         Scanner scanner = new Scanner(System.in);
         System.out.print("Mode? (G)enerate Keypair / (S)ign / (V)erify / (E)ncrypt / (D)ecrypt\n"
                          + "S2 (using inputs/text) / V2 / E2 \nSF(ile) / VF / EF / DF\n"
-                         + "**.E** (group‑encrypt text) / **.E2** (group‑encrypt text‑file) / **.EF** (group‑encrypt File): ");
+                         + "**.E** (group‑encrypt text) / **.E2** (group‑encrypt text‑file) / **.EF** (group‑encrypt File) / K (DH Key-Exchange): ");
         String mode = scanner.nextLine().trim().toUpperCase();
 
         switch (mode) {
+            case "K":
+                doManualDH(scanner);
+                break;
 
             case ".E":
                 doGroupEncrypt(scanner);
@@ -169,7 +415,7 @@ public class Main {
         byte[] sig = Base64.getDecoder().decode(sigB64);
 
         // 1) Try every .pem in keys/
-        File[] files = new File("keys").listFiles((d,n)->n.endsWith(".pem"));
+        File[] files = new File("keys").listFiles();
         if (files != null) {
             for (File f : files) {
                 String name = f.getName();
@@ -254,7 +500,7 @@ public class Main {
         byte[] sig = Base64.getDecoder().decode(sigB64);
 
         // 2) Try every .pem in keys/
-        File[] files = new File("keys").listFiles((d, n) -> n.endsWith(".pem"));
+        File[] files = new File("keys").listFiles();
         if (files != null) {
             for (File f : files) {
                 String name = f.getName();
@@ -432,7 +678,7 @@ public class Main {
         byte[] sig = Base64.getDecoder().decode(sigB64);
         byte[] data = readBinaryFile(filename);
 
-        File[] files = new File("keys").listFiles((d, n) -> n.endsWith(".pem"));
+        File[] files = new File("keys").listFiles();
         if (files != null) {
             for (File f : files) {
                 String name = f.getName();
@@ -602,7 +848,7 @@ public class Main {
         // 1) discover all .pem in keys/ that actually parse as an RSA private key
         List<String> valid = new ArrayList<>();
         File dir = new File("keys");
-        File[] all = dir.listFiles((d,n)->n.endsWith(".pem"));
+        File[] all = dir.listFiles();
         if (all!=null) for(File f:all){
             try {
                 String raw = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8)
@@ -662,7 +908,7 @@ public class Main {
         // 1) discover all .pem in keys/ that actually parse as an RSA public key
         List<String> valid = new ArrayList<>();
         File dir = new File("keys");
-        File[] all = dir.listFiles((d,n)->n.endsWith(".pem"));
+        File[] all = dir.listFiles();
         if (all!=null) for(File f:all){
             try {
                 String raw = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8)
@@ -891,7 +1137,7 @@ public class Main {
         names.add(".");  // index 0 → your default publickey.pem
 
         File dir = new File("keys");
-        File[] all = dir.listFiles((d, n) -> n.endsWith(".pem"));
+        File[] all = dir.listFiles();
         if (all != null) {
             for (File f : all) {
                 try {
@@ -996,7 +1242,7 @@ public class Main {
         names.add(".");  // index 0 → your default publickey.pem
 
         File dir = new File("keys");
-        File[] all = dir.listFiles((d, n) -> n.endsWith(".pem"));
+        File[] all = dir.listFiles();
         if (all != null) {
             for (File f : all) {
                 try {
@@ -1115,7 +1361,7 @@ public class Main {
         names.add(".");  // index 0 → default publickey.pem
         File keysDir = new File("keys");
         if (keysDir.isDirectory()) {
-            for (File f : Objects.requireNonNull(keysDir.listFiles((d, n)->n.endsWith(".pem")))) {
+            for (File f : Objects.requireNonNull(keysDir.listFiles())) {
                 String pem = Files.readString(f.toPath(), StandardCharsets.UTF_8)
                         .replaceAll("-----.*?-----", "")
                         .replaceAll("\\s+", "");
@@ -1125,7 +1371,7 @@ public class Main {
                     KeyFactory.getInstance("RSA").generatePublic(spec);
                     names.add(f.getName());
                 } catch (Exception ignored) {
-                    // not a valid public-key PEM
+                    // not a valihd public-key PEM
                 }
             }
         }
