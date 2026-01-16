@@ -40,3 +40,4 @@ build/
 /inputs/archive/
 /keys/archiprivatekey.pem
 /keys/wuffprivatekey.pem
+/vault.txt
