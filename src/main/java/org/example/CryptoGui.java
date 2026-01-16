@@ -245,7 +245,7 @@ public class CryptoGui extends JFrame {
         pubKeyPanel.add(browseFileOpPublicBtn, BorderLayout.SOUTH);
 
         // ── Private Key panel ──────────────────────────────────────────
-        fileOpPrivateKeyArea = new JTextArea();
+        fileOpPrivateKeyArea = new MaskableTextArea();
         fileOpPrivateKeyArea.setColumns(5);
 
         JPanel privKeyPanel = new JPanel(new BorderLayout(4,4));
@@ -905,7 +905,7 @@ public class CryptoGui extends JFrame {
         JPanel panel = new JPanel(new BorderLayout(10,10));
 
         // ── PRIVATE KEY ─────────────────────────────────────────
-        decryptPrivateKeyArea = new JTextArea();
+        decryptPrivateKeyArea = new MaskableTextArea();
         decryptPrivateKeyArea.setColumns(5);
 
         JScrollPane keyScroll = new JScrollPane(decryptPrivateKeyArea);
@@ -1206,7 +1206,7 @@ public class CryptoGui extends JFrame {
         JPanel panel = new JPanel(new BorderLayout(10, 10));
 
         // Key text areas with titled borders
-        privateKeyArea = new JTextArea();
+        privateKeyArea = new MaskableTextArea();
         privateKeyArea.setColumns(5);
 
         publicKeyArea  = new JTextArea();
@@ -1415,7 +1415,7 @@ public class CryptoGui extends JFrame {
         JPanel panel = new JPanel(new BorderLayout(10, 10));
 
         // ── PRIVATE KEY ─────────────────────────────────────────────
-        signPrivateKeyArea = new JTextArea();
+        signPrivateKeyArea = new MaskableTextArea();
         signPrivateKeyArea.setColumns(5);
 
         JPanel privPanel = new JPanel(new BorderLayout());
@@ -1478,6 +1478,101 @@ public class CryptoGui extends JFrame {
             );
         }
     }
+
+
+
+    // Obfuscates visually when NOT focused, shows real text when focused.
+// Does NOT modify the Document (so no extra DocumentListener triggers).
+    private static final class MaskableTextArea extends JTextArea {
+        private boolean paintHidden = false;
+        private final char maskChar = '\u2022'; // • bullet
+
+        MaskableTextArea() {
+            super();
+            // Keys look best in monospace, and this keeps masking aligned.
+            setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+
+            // Repaint on focus changes so it flips instantly.
+            addFocusListener(new java.awt.event.FocusAdapter() {
+                @Override public void focusGained(java.awt.event.FocusEvent e) { repaint(); }
+                @Override public void focusLost (java.awt.event.FocusEvent e) { repaint(); }
+            });
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            if (isFocusOwner()) {
+                paintHidden = false;
+                super.paintComponent(g);
+                return;
+            }
+
+            // First paint normally, but with "hidden" foreground so actual glyphs don't show.
+            paintHidden = true;
+            super.paintComponent(g);
+            paintHidden = false;
+
+            // Then draw masked text on top (same layout, same scrolling).
+            paintMaskedText(g);
+        }
+
+        @Override
+        public Color getForeground() {
+            // Only hide foreground during the "super.paintComponent" call above.
+            if (paintHidden) return getBackground();
+            return super.getForeground();
+        }
+
+        private void paintMaskedText(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            try {
+                g2.setFont(getFont());
+                g2.setColor(super.getForeground());
+
+                FontMetrics fm = g2.getFontMetrics();
+                Rectangle vis = getVisibleRect();
+
+                int startOffset = viewToModel(new Point(vis.x, vis.y));
+                int endOffset   = viewToModel(new Point(vis.x, vis.y + vis.height));
+
+                int startLine = getLineOfOffset(startOffset);
+                int endLine   = getLineOfOffset(endOffset);
+
+                for (int line = startLine; line <= endLine; line++) {
+                    int ls = getLineStartOffset(line);
+                    int le = getLineEndOffset(line);
+
+                    String s = getDocument().getText(ls, le - ls);
+
+                    // Don’t draw the newline chars
+                    int len = s.length();
+                    while (len > 0) {
+                        char c = s.charAt(len - 1);
+                        if (c == '\n' || c == '\r') len--;
+                        else break;
+                    }
+                    if (len <= 0) continue;
+
+                    Rectangle r = modelToView(ls);
+                    int x = r.x;
+                    int y = r.y + fm.getAscent();
+
+                    g2.drawString(repeat(maskChar, len), x, y);
+                }
+            } catch (Exception ignored) {
+                // If anything goes weird, fail open (next repaint will try again).
+            } finally {
+                g2.dispose();
+            }
+        }
+
+        private static String repeat(char ch, int count) {
+            char[] arr = new char[count];
+            Arrays.fill(arr, ch);
+            return new String(arr);
+        }
+    }
+
 
     private void importSignKey() {
         JFileChooser chooser = new JFileChooser(Paths.get("keys").toFile());
